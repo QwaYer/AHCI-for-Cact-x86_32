@@ -19,24 +19,25 @@
 #include "pci_enum.h"
 #include "devfs.h"
 #include "sync.h"
+#include "klib.h"
 
 /* ── kernel entry points (resolved via ksym at load time) ───────── */
-extern void     kprint(char* s);
-extern void     kprint_hex(uint32_t v);
-extern void     klog(int level, const char* msg);
+extern void     printk(const char* fmt, ...);
+extern void     printk_hex(uint32_t v);
+
 extern void*    kmalloc(uint32_t size);
 extern void*    kmalloc_aligned(uint32_t size, uint32_t align);
-extern void     kfree_aligned(void* p);
-extern void     kfree_heap(void* p);
+extern void     kfree(void* p);
+extern void     kfree(void* p);
 extern void*    memset(void* s, int c, uint32_t n);
 extern void*    memcpy(void* dst, const void* src, uint32_t n);
-extern void     itoa(int n, char* str);
-extern void     hex_to_ascii(uint32_t n, char str[]);
-extern uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg);
-extern void     pci_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg,
+
+
+extern uint32_t pci_read_config_dword(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg);
+extern void     pci_write_config_dword(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg,
                             uint32_t val);
-extern uint8_t  port_byte_in (uint16_t port);
-extern void     port_byte_out(uint16_t port, uint8_t val);
+extern uint8_t  inb (uint16_t port);
+extern void     outb(uint16_t port, uint8_t val);
 extern void     vmm_map(uint32_t* pd, uint32_t va, uint32_t pa, int flags);
 extern void     irq_spinlock_init   (irq_spinlock_t* lock);
 extern void     irq_spinlock_acquire(irq_spinlock_t* lock);
@@ -65,15 +66,15 @@ extern void     mutex_init  (mutex_t* m);
 extern void     mutex_lock  (mutex_t* m);
 extern void     mutex_unlock(mutex_t* m);
 extern void     sema_init   (semaphore_t* s, int val);
-extern void     sema_down   (semaphore_t* s);
-extern void     sema_up     (semaphore_t* s);
-extern devfs_entry_t* devfs_register  (const char* name, uint32_t flags,
+extern void     down   (semaphore_t* s);
+extern void     up     (semaphore_t* s);
+extern devfs_entry_t* register_chrdev  (const char* name, uint32_t flags,
                                        devfs_driver_t* drv, void* drv_priv);
-extern int            devfs_unregister(const char* name);
-extern int blkdev_register(const char *name, uint32_t max_lba,
+extern int            unregister_chrdev(const char* name);
+extern int register_blkdev(const char *name, uint32_t max_lba,
                            void (*read_sector)(uint32_t lba, uint8_t *buf),
                            void (*write_sector)(uint32_t lba, uint8_t *buf));
-extern void blkdev_unregister(const char *name);
+extern void unregister_blkdev(const char *name);
 
 /* PTE flags (memory.h) — duplicated here so the module is independent */
 #define PAGE_PRESENT 0x1
@@ -81,11 +82,6 @@ extern void blkdev_unregister(const char *name);
 #define PAGE_PWT     0x8
 #define PAGE_PCD     0x10
 
-/* klog levels (kernel.h enum log_level_t) */
-#define KLOG_OK    0
-#define KLOG_WARN  1
-#define KLOG_ERROR 2
-#define KLOG_FAIL  3
 
 /* GHC bits */
 #define HBA_GHC_HR  (1u << 0)
@@ -158,7 +154,7 @@ static void ahci_stop_cmd(hba_port_t *port) {
             return;
         ahci_udelay(1000);
     }
-    kprint("[AHCI] stop_cmd timeout port\n");
+    printk("[AHCI] stop_cmd timeout port\n");
 }
 
 static void ahci_start_cmd(hba_port_t *port) {
@@ -173,7 +169,7 @@ static int ahci_find_cmdslot(hba_port_t *port) {
     for (int i = 0; i < AHCI_CMD_SLOTS; i++)
         if (!(slots & (1u << i)))
             return i;
-    kprint("[AHCI] no free cmd slot\n");
+    printk("[AHCI] no free cmd slot\n");
     return -1;
 }
 
@@ -185,8 +181,8 @@ static void ahci_port_rebase(int portno) {
     cmd_headers[portno] = (hba_cmd_header_t *)kmalloc_aligned(
         sizeof(hba_cmd_header_t) * AHCI_CMD_SLOTS, 1024);
     if (!cmd_headers[portno]) {
-        kprint("[AHCI] alloc cmd_headers failed port=");
-        char b[16]; itoa(portno, b); kprint(b); kprint("\n");
+        printk("[AHCI] alloc cmd_headers failed port=");
+        char b[16]; printk("%d\n", (int)(portno));
         return;
     }
     memset((void *)cmd_headers[portno], 0, sizeof(hba_cmd_header_t) * AHCI_CMD_SLOTS);
@@ -196,7 +192,7 @@ static void ahci_port_rebase(int portno) {
 
     fis_bufs[portno] = (uint8_t *)kmalloc_aligned(256, 256);
     if (!fis_bufs[portno]) {
-        kprint("[AHCI] alloc fis_buf failed\n");
+        printk("[AHCI] alloc fis_buf failed\n");
         return;
     }
     memset(fis_bufs[portno], 0, 256);
@@ -207,7 +203,7 @@ static void ahci_port_rebase(int portno) {
     cmd_tables[portno] = (hba_cmd_tbl_t *)kmalloc_aligned(
         sizeof(hba_cmd_tbl_t) * AHCI_CMD_SLOTS, 128);
     if (!cmd_tables[portno]) {
-        kprint("[AHCI] alloc cmd_tables failed\n");
+        printk("[AHCI] alloc cmd_tables failed\n");
         return;
     }
     memset((void *)cmd_tables[portno], 0, sizeof(hba_cmd_tbl_t) * AHCI_CMD_SLOTS);
@@ -251,7 +247,7 @@ static void ahci_isr(void) {
 
     if (wake && cmd_inflight) {
         cmd_inflight = 0;
-        sema_up(&cmd_done);
+        up(&cmd_done);
     }
 }
 
@@ -263,9 +259,9 @@ static int ahci_wait_cmd_done(hba_port_t *port, int slot, const char *tag) {
         if (!cmd_inflight) return cmd_err ? -1 : 0;
         ahci_udelay(10);
     }
-    kprint("[AHCI] timeout: ");
-    kprint((char *)tag);
-    kprint("\n");
+    printk("[AHCI] timeout: ");
+    printk((char *)tag);
+    printk("\n");
     cmd_inflight = 0;
     return -1;
 }
@@ -356,7 +352,7 @@ static int ahci_identify(int portno) {
     if (slot < 0) {
         irq_spinlock_release(&ahci_lock);
         mutex_unlock(&cmd_mutex);
-        kfree_aligned(id_buf);
+        kfree(id_buf);
         return -1;
     }
 
@@ -394,7 +390,7 @@ static int ahci_identify(int portno) {
     int err = ahci_wait_cmd_done(port, slot, "identify");
     mutex_unlock(&cmd_mutex);
 
-    if (err) { kfree_aligned(id_buf); return -1; }
+    if (err) { kfree(id_buf); return -1; }
 
     uint16_t *id16 = (uint16_t *)id_buf;
     uint32_t  lba28 = (uint32_t)id16[60] | ((uint32_t)id16[61] << 16);
@@ -409,7 +405,7 @@ static int ahci_identify(int portno) {
     for (int i = 39; i >= 0 && ports_info[portno].model[i] == ' '; i--)
         ports_info[portno].model[i] = '\0';
 
-    kfree_aligned(id_buf);
+    kfree(id_buf);
     return 0;
 }
 
@@ -457,7 +453,7 @@ static int ahci_init_controller(uint32_t mmio) {
         ahci_udelay(1000);
     }
     if (abar->ghc & HBA_GHC_HR) {
-        kprint("[AHCI] HBA reset timeout\n");
+        printk("[AHCI] HBA reset timeout\n");
         return -1;
     }
 
@@ -559,11 +555,11 @@ static void ahci_blk_write_sector(uint32_t lba, uint8_t *buf) {
 /* ── teardown ───────────────────────────────────────────────────── */
 
 static void ahci_detach(void) {
-    blkdev_unregister("sda");
+    unregister_blkdev("sda");
     ahci_blk_port = -1;
 
     if (devfs_was_registered) {
-        devfs_unregister("sda");
+        unregister_chrdev("sda");
         devfs_was_registered = 0;
     }
 
@@ -589,12 +585,12 @@ static void ahci_detach(void) {
 
     /* Restore PCI command register if we changed it */
     if (ahci_attached)
-        pci_write32(ahci_bus, ahci_dev, ahci_fn, 0x04, saved_pci_cmd_dw);
+        pci_write_config_dword(ahci_bus, ahci_dev, ahci_fn, 0x04, saved_pci_cmd_dw);
 
     for (int i = 0; i < AHCI_MAX_PORTS; i++) {
-        if (cmd_headers[i]) { kfree_aligned(cmd_headers[i]); cmd_headers[i] = 0; }
-        if (cmd_tables [i]) { kfree_aligned(cmd_tables [i]); cmd_tables [i] = 0; }
-        if (fis_bufs   [i]) { kfree_aligned(fis_bufs   [i]); fis_bufs   [i] = 0; }
+        if (cmd_headers[i]) { kfree(cmd_headers[i]); cmd_headers[i] = 0; }
+        if (cmd_tables [i]) { kfree(cmd_tables [i]); cmd_tables [i] = 0; }
+        if (fis_bufs   [i]) { kfree(fis_bufs   [i]); fis_bufs   [i] = 0; }
     }
 
     abar             = 0;
@@ -613,14 +609,14 @@ int pci_driver_probe(pci_device_t *pdev) {
     if (!pdev) return -1;
 
     if (ahci_attached) {
-        kprint("[AHCI] additional HBA at bus=");
-        kprint_hex(pdev->bus); kprint(" dev="); kprint_hex(pdev->dev);
-        kprint(" — already attached, skipping\n");
+        printk("[AHCI] additional HBA at bus=");
+        printk_hex(pdev->bus); printk(" dev="); printk_hex(pdev->dev);
+        printk(" — already attached, skipping\n");
         return -1;
     }
 
     if (pdev->prog_if != 0x01) {
-        kprint("[AHCI] prog_if!=0x01 (IDE-emulation) — skipping\n");
+        printk("[AHCI] prog_if!=0x01 (IDE-emulation) — skipping\n");
         return -1;
     }
 
@@ -630,10 +626,10 @@ int pci_driver_probe(pci_device_t *pdev) {
     cmd_inflight = 0;
     cmd_err      = 0;
 
-    kprint("[AHCI] probe bus=");
-    kprint_hex(pdev->bus); kprint(" dev="); kprint_hex(pdev->dev);
-    kprint(" fn="); kprint_hex(pdev->fn);
-    kprint(" irq="); kprint_hex(pdev->irq_line); kprint("\n");
+    printk("[AHCI] probe bus=");
+    printk_hex(pdev->bus); printk(" dev="); printk_hex(pdev->dev);
+    printk(" fn="); printk_hex(pdev->fn);
+    printk(" irq="); printk_hex(pdev->irq_line); printk("\n");
 
     ahci_bus = pdev->bus;
     ahci_dev = pdev->dev;
@@ -646,19 +642,19 @@ int pci_driver_probe(pci_device_t *pdev) {
         }
     }
     if (!mmio)
-        mmio = pci_read32(pdev->bus, pdev->dev, pdev->fn, 0x24) & ~0xFu;
+        mmio = pci_read_config_dword(pdev->bus, pdev->dev, pdev->fn, 0x24) & ~0xFu;
     if (!mmio) {
-        klog(KLOG_FAIL, "AHCI (kmod): no MMIO BAR");
+        printk("3" "AHCI (kmod): no MMIO BAR");
         return -1;
     }
 
     /* Save PCI command register, enable bus master + memory space, leave INTx
      * routing enabled (clear bit 10 == INTx Disable; we WANT INTx). */
-    saved_pci_cmd_dw = pci_read32(pdev->bus, pdev->dev, pdev->fn, 0x04);
+    saved_pci_cmd_dw = pci_read_config_dword(pdev->bus, pdev->dev, pdev->fn, 0x04);
     uint32_t cmd     = saved_pci_cmd_dw;
     cmd |=  0x06u;            /* MEM | BUS_MASTER */
     cmd &= ~(1u << 10);       /* clear INTx Disable */
-    pci_write32(pdev->bus, pdev->dev, pdev->fn, 0x04, cmd);
+    pci_write_config_dword(pdev->bus, pdev->dev, pdev->fn, 0x04, cmd);
 
     /* Wire ISR via MSI-X before enabling controller IE */
     {
@@ -674,16 +670,16 @@ int pci_driver_probe(pci_device_t *pdev) {
                 pci_msix_enable(pdev, vec, table, 0);
                 ahci_msix_vector = vec;
                 ahci_msix_table  = table;
-                klog(KLOG_OK, "AHCI: MSI-X enabled");
+                printk("6" "AHCI: MSI-X enabled");
             }
         }
         if (ahci_msix_vector < 0) {
-            klog(KLOG_WARN, "AHCI: MSI-X unavailable — using poll mode (slow)");
+            printk("4" "AHCI: MSI-X unavailable — using poll mode (slow)");
         }
     }
 
     if (ahci_init_controller(mmio) < 0) {
-        klog(KLOG_FAIL, "AHCI (kmod): controller init failed");
+        printk("3" "AHCI (kmod): controller init failed");
         ahci_detach();
         return -1;
     }
@@ -695,13 +691,13 @@ int pci_driver_probe(pci_device_t *pdev) {
     }
     if (port < 0) port = ahci_first_port();
     if (!ahci_ready || port < 0) {
-        klog(KLOG_WARN, "AHCI (kmod): no active SATA ports");
+        printk("4" "AHCI (kmod): no active SATA ports");
         ahci_detach();
         return -1;
     }
 
     if (!ports_info[port].model[0]) {
-        klog(KLOG_WARN, "AHCI (kmod): identify timeout, using fallback geometry");
+        printk("4" "AHCI (kmod): identify timeout, using fallback geometry");
         ports_info[port].max_lba = 0x0FFFFFFFu;
         ports_info[port].model[0] = 'S';
         ports_info[port].model[1] = 'A';
@@ -716,26 +712,26 @@ int pci_driver_probe(pci_device_t *pdev) {
     }
 
     {
-        char tmp[16]; itoa(port, tmp);
-        kprint("[AHCI] active SATA port="); kprint(tmp);
-        kprint(" model="); kprint(ports_info[port].model);
-        kprint(" IRQ=MSI-X\n");
+        char tmp[16]; snprintf(tmp, sizeof(tmp), "%d", (int)(port));
+        printk("[AHCI] active SATA port="); printk(tmp);
+        printk(" model="); printk(ports_info[port].model);
+        printk(" IRQ=MSI-X\n");
     }
 
     ahci_attached = 1;            /* set BEFORE devfs so detach restores PCI cmd */
 
-    if (devfs_register("sda", DEVFS_F_BLOCK, &drv_ahci, 0)) {
+    if (register_chrdev("sda", DEVFS_F_BLOCK, &drv_ahci, 0)) {
         devfs_was_registered = 1;
     } else {
-        klog(KLOG_WARN, "AHCI (kmod): devfs_register('sda') failed");
+        printk("4" "AHCI (kmod): register_chrdev('sda') failed");
     }
 
     ahci_blk_port = port;
-    if (blkdev_register("sda", ports_info[port].max_lba, ahci_blk_read_sector,
+    if (register_blkdev("sda", ports_info[port].max_lba, ahci_blk_read_sector,
                         ahci_blk_write_sector) != 0)
-        klog(KLOG_WARN, "AHCI (kmod): blkdev_register('sda') failed");
+        printk("4" "AHCI (kmod): register_blkdev('sda') failed");
 
-    klog(KLOG_OK, "AHCI (kmod): IRQ-driven driver attached — /dev/sda registered");
+    printk("6" "AHCI (kmod): IRQ-driven driver attached — /dev/sda registered");
     return 0;
 }
 
@@ -744,5 +740,5 @@ void pci_driver_remove(pci_device_t *dev) {
     int had_any = ahci_attached || devfs_was_registered || abar != 0;
     ahci_detach();
     if (had_any)
-        klog(KLOG_OK, "AHCI (kmod): unloaded");
+        printk("6" "AHCI (kmod): unloaded");
 }
