@@ -43,25 +43,8 @@ extern void     irq_spinlock_init   (irq_spinlock_t* lock);
 extern void     irq_spinlock_acquire(irq_spinlock_t* lock);
 extern void     irq_spinlock_release(irq_spinlock_t* lock);
 
-/* MSI-X table entry struct (must match kernel's msi.h) */
-struct msix_table_entry {
-    uint32_t msg_addr_lo;
-    uint32_t msg_addr_hi;
-    uint32_t msg_data;
-    uint32_t vector_ctrl;
-} __attribute__((packed));
-
-extern int      msix_alloc_vector(void);
-extern void     msix_free_vector(int vec);
-extern int      msix_register_handler(int vec, void (*handler)(void));
-extern void     msix_unregister_handler(int vec);
-extern int      pci_msix_support(pci_device_t *dev);
-extern int      pci_msix_table_map(pci_device_t *dev,
-                                   volatile struct msix_table_entry **table_out,
-                                   uint32_t *table_size_out);
-extern int      pci_msix_enable(pci_device_t *dev, int vec,
-                                volatile struct msix_table_entry *table,
-                                unsigned int entry_idx);
+extern int      msidev_register(pci_device_t *dev, void (*handler)(void));
+extern void     msidev_unregister(int vec);
 extern void     mutex_init  (mutex_t* m);
 extern void     mutex_lock  (mutex_t* m);
 extern void     mutex_unlock(mutex_t* m);
@@ -107,7 +90,6 @@ static int               ahci_attached;
 static int               devfs_was_registered;
 
 static int               ahci_msix_vector;
-static volatile struct msix_table_entry *ahci_msix_table;
 static uint32_t          saved_pci_cmd_dw;
 static uint8_t           ahci_bus, ahci_dev, ahci_fn;
 
@@ -577,10 +559,8 @@ static void ahci_detach(void) {
     }
 
     if (ahci_msix_vector >= 0) {
-        msix_unregister_handler(ahci_msix_vector);
-        msix_free_vector(ahci_msix_vector);
+        msidev_unregister(ahci_msix_vector);
         ahci_msix_vector = -1;
-        ahci_msix_table  = NULL;
     }
 
     /* Restore PCI command register if we changed it */
@@ -656,21 +636,15 @@ int pci_driver_probe(pci_device_t *pdev) {
     cmd &= ~(1u << 10);       /* clear INTx Disable */
     pci_write_config_dword(pdev->bus, pdev->dev, pdev->fn, 0x04, cmd);
 
-    /* Wire ISR via MSI-X before enabling controller IE */
+    /* Wire the ISR before enabling controller IE: msidev_register() picks
+     * MSI-X when the HBA has it and MSI otherwise. */
     {
-        volatile struct msix_table_entry *table = NULL;
-        uint32_t table_size = 0;
         ahci_msix_vector = -1;
-        ahci_msix_table  = NULL;
-        int cap = pci_msix_support(pdev);
-        if (cap && pci_msix_table_map(pdev, &table, &table_size) == 0 && table_size > 0) {
-            int vec = msix_alloc_vector();
+        {
+            int vec = msidev_register(pdev, ahci_isr);
             if (vec > 0) {
-                msix_register_handler(vec, ahci_isr);
-                pci_msix_enable(pdev, vec, table, 0);
                 ahci_msix_vector = vec;
-                ahci_msix_table  = table;
-                printk("6" "AHCI: MSI-X enabled");
+                printk("6" "AHCI: IRQ enabled");
             }
         }
         if (ahci_msix_vector < 0) {
@@ -715,7 +689,7 @@ int pci_driver_probe(pci_device_t *pdev) {
         char tmp[16]; snprintf(tmp, sizeof(tmp), "%d", (int)(port));
         printk("[AHCI] active SATA port="); printk(tmp);
         printk(" model="); printk(ports_info[port].model);
-        printk(" IRQ=MSI-X\n");
+        printk(" IRQ=enabled\n");
     }
 
     ahci_attached = 1;            /* set BEFORE devfs so detach restores PCI cmd */
