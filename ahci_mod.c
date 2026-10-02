@@ -4,7 +4,7 @@
  * Build: make  (KERN_ROOT defaults to ../CactKernel-x86_32)
  *        or from kernel: make ahci-module
  *
- * Load (root): modload /lib/ahci.cctk
+ * Load (root): modload /usr/lib/modules/ahci.cctk
  *   Manifest binds PCI class 01:06 (SATA AHCI). Probe filters prog_if==0x01.
  *
  * I/O model: interrupt-driven. PxIE enables D2H/PIO/DMA-setup/TFES sources;
