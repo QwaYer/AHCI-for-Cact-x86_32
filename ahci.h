@@ -7,6 +7,12 @@
 #define AHCI_MAX_PORTS       32
 #define AHCI_CMD_SLOTS       32
 #define AHCI_SECTOR_SIZE     512
+// Whole disks this driver exposes (sda..sdh).  Matches BLKDEV_MAX_DISKS in
+// the kernel's block layer, which is the real ceiling.
+#define AHCI_MAX_DISKS       8
+// Largest addressable LBA in the 32-bit block layer (2 TiB of 512-byte
+// sectors).  A bigger drive is clamped here, with a warning.
+#define AHCI_MAX_LBA         0xFFFFFFFFu
 
 // Port signatures in PxSIG after device detection
 #define AHCI_SIG_ATA         0x00000101
@@ -27,9 +33,16 @@
 
 // PxCMD bits
 #define HBA_PxCMD_ST    0x0001   // start
+#define HBA_PxCMD_SUD   0x0002   // spin-up device
+#define HBA_PxCMD_POD   0x0004   // power on device
 #define HBA_PxCMD_FRE   0x0010   // FIS receive enable
 #define HBA_PxCMD_FR    0x4000   // FIS receive running
 #define HBA_PxCMD_CR    0x8000   // command list running
+#define HBA_PxCMD_CPD   0x20000000  // cold presence detect
+
+// PxSCTL field masks (DET/SPD/IPM occupy bits 11:0)
+#define HBA_PxSCTL_MASK 0x00000FFF
+#define HBA_PxSCTL_DET_RESET 0x00000001  // DET=1 -> COMRESET
 
 // PxIS — interrupt status
 #define HBA_PxIS_TFES   (1u << 30)  // task file error
@@ -124,7 +137,7 @@ typedef struct {
     hba_prdt_entry_t prdt[8];
 } __attribute__((packed)) hba_cmd_tbl_t;
 
-// Register FIS — Host to Device (28-bit LBA)
+// Register FIS — Host to Device (48-bit LBA; lba4/lba5 carry bits 47:32)
 typedef struct {
     uint8_t  fis_type;
     uint8_t  pm_port : 4;
@@ -152,7 +165,9 @@ typedef struct {
     uint8_t  type;
     uint8_t  port_num;
     uint32_t max_lba;
-    char     model[41];
+    uint32_t sector_size;   // logical sector size from IDENTIFY word 106
+    char     model[41];     // IDENTIFY words 27..46
+    char     serial[21];    // IDENTIFY words 10..19
 } ahci_port_info_t;
 
 #endif

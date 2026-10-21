@@ -5,7 +5,9 @@
  *        or from kernel: make ahci-module
  *
  * Load (root): modload /usr/lib/modules/ahci.cctk
- *   Manifest binds PCI class 01:06 (SATA AHCI). Probe filters prog_if==0x01.
+ *   Manifest binds PCI class 01:06 (SATA AHCI). Probe accepts prog_if 0x00,
+ *   0x01, 0x02 and the vendor-specific range; anything but 0x01 must pass
+ *   an AHCI capability check before the HBA is used.
  *
  * I/O model: interrupt-driven. PxIE enables D2H/PIO/DMA-setup/TFES sources;
  * GHC.IE enables HBA-level interrupt routing via PCI INTx. Each rw_sector()
@@ -39,6 +41,7 @@ extern void     pci_write_config_dword(uint8_t bus, uint8_t dev, uint8_t fn, uin
 extern uint8_t  inb (uint16_t port);
 extern void     outb(uint16_t port, uint8_t val);
 extern void     vmm_map(uint32_t* pd, uint32_t va, uint32_t pa, int flags);
+extern void     ktime_busy_wait_us(uint64_t us);
 extern void     irq_spinlock_init   (irq_spinlock_t* lock);
 extern void     irq_spinlock_acquire(irq_spinlock_t* lock);
 extern void     irq_spinlock_release(irq_spinlock_t* lock);
@@ -58,6 +61,7 @@ extern int register_blkdev(const char *name, uint32_t max_lba,
                            void (*read_sector)(uint32_t lba, uint8_t *buf),
                            void (*write_sector)(uint32_t lba, uint8_t *buf));
 extern void unregister_blkdev(const char *name);
+extern int  blkdev_set_ident(const char *name, const char *ident);
 
 /* PTE flags (memory.h) — duplicated here so the module is independent */
 #define PAGE_PRESENT 0x1
@@ -70,6 +74,11 @@ extern void unregister_blkdev(const char *name);
 #define HBA_GHC_HR  (1u << 0)
 #define HBA_GHC_IE  (1u << 1)
 #define HBA_GHC_AE  (1u << 31)
+
+/* BOHC bits — BIOS/OS handoff (register at 0x28) */
+#define HBA_BOHC_BOS  (1u << 0)   /* BIOS Owned Semaphore */
+#define HBA_BOHC_OOS  (1u << 1)   /* OS Owned Semaphore */
+#define HBA_BOHC_BB   (1u << 4)   /* BIOS Busy */
 
 /* Inline CR3 read — replaces static-inline get_current_pd() from kernel.h */
 static inline uint32_t* get_current_pd(void) {
@@ -105,10 +114,77 @@ static uint8_t          *fis_bufs   [AHCI_MAX_PORTS];
 
 
 
-/* ~10 us busy-wait with PAUSE hint */
+/* Busy-wait for `us` microseconds.  The kernel's ktime_busy_wait_us() is
+ * calibrated against the TSC (or the ACPI PM timer), so the delay is real.
+ * The earlier hand-rolled PAUSE loop ran an order of magnitude faster than a
+ * microsecond and under-waited every HBA reset/settle window. */
 static void ahci_udelay(uint32_t us) {
-    for (volatile uint32_t i = 0; i < us * 10; i++)
-        __asm__ __volatile__("pause");
+    ktime_busy_wait_us((uint64_t)us);
+}
+
+/* Take ownership of the HBA from the firmware.
+ *
+ * If the BIOS left BOHC.BOS set it still owns the controller and may be
+ * driving the ports (common on OEM/UEFI boards).  Claim ownership by setting
+ * OOS and poll until the BIOS clears BOS — the AHCI spec allows up to one
+ * second.  Firmware that never set BOS (QEMU, most legacy BIOS) returns
+ * immediately, leaving the register untouched. */
+static void ahci_bios_handoff(void) {
+    uint32_t bohc = abar->bohc;
+
+    if (!(bohc & HBA_BOHC_BOS))
+        return;
+
+    printk("[AHCI] firmware owns the HBA (BOHC=");
+    printk_hex(bohc);
+    printk("): requesting handoff\n");
+
+    abar->bohc = bohc | HBA_BOHC_OOS;
+
+    for (int i = 0; i < 1000; i++) {
+        bohc = abar->bohc;
+        if (!(bohc & HBA_BOHC_BOS)) {
+            printk("[AHCI] BIOS/OS handoff complete (BOHC=");
+            printk_hex(bohc);
+            printk(")\n");
+            return;
+        }
+        ahci_udelay(1000);
+    }
+
+    printk("[AHCI] BIOS/OS handoff timeout (BOHC=");
+    printk_hex(bohc);
+    printk(") — continuing anyway\n");
+}
+
+/* Confirm an AHCI register block at the ABAR.  Used for controllers whose
+ * prog_if is not the AHCI 1.0 value: CAP.NP must describe 1..32 ports and VS
+ * must report major version 1.  These are read-only peeks; the HBA is left
+ * untouched until this passes. */
+static int ahci_hba_sane(uint32_t mmio) {
+    volatile uint32_t *regs = (volatile uint32_t *)(uintptr_t)mmio;
+    uint32_t cap = regs[0];      /* CAP @ 0x00 */
+    uint32_t vs  = regs[4];      /* VS  @ 0x10 */
+
+    if (cap == 0 || cap == 0xFFFFFFFFu)
+        return 0;
+    if ((cap & 0x1Fu) > 31)      /* NP = ports - 1, must be 0..31 */
+        return 0;
+    if (vs == 0 || vs == 0xFFFFFFFFu)
+        return 0;
+    if ((vs >> 16) != 1)         /* major version must be 1.x */
+        return 0;
+    return 1;
+}
+
+/* Is this programming interface one a SATA HBA may legitimately report?
+ * 0x01 is AHCI 1.0; 0x00 (vendor specific) and 0x02 (serial storage bus) turn
+ * up on OEM firmware (HP/Intel boards with vendor storage modes enabled) for
+ * controllers that really are AHCI HBAs underneath; 0x80..0xFF is the PCI
+ * "vendor specific" range.  Everything else is reserved.  The non-0x01 values
+ * are only trusted once ahci_hba_sane() agrees. */
+static int ahci_prog_if_sata_hba(uint8_t prog_if) {
+    return prog_if <= 0x02 || prog_if >= 0x80;
 }
 
 static int ahci_check_type(hba_port_t *port) {
@@ -127,6 +203,28 @@ static int ahci_check_type(hba_port_t *port) {
     }
 }
 
+/* Wait until the port reports DET=present / IPM=active.  The unit is a rough
+ * millisecond: ahci_udelay() is a PAUSE-counted busy wait, not a timer. */
+static int ahci_wait_link(hba_port_t *port, uint32_t ms) {
+    for (uint32_t i = 0; i < ms; i++) {
+        uint32_t ssts = port->ssts;
+        if ((ssts & 0x0F) == HBA_PORT_DET_PRESENT &&
+            ((ssts >> 8) & 0x0F) == HBA_PORT_IPM_ACTIVE)
+            return 0;
+        ahci_udelay(1000);
+    }
+    return -1;
+}
+
+/* COMRESET the link: DET=1 for >1 ms, then DET=0 with SPD/IPM cleared. */
+static void ahci_port_comreset(hba_port_t *port) {
+    port->sctl = (port->sctl & ~HBA_PxSCTL_MASK) | HBA_PxSCTL_DET_RESET;
+    ahci_udelay(2000);
+    port->sctl &= ~HBA_PxSCTL_MASK;
+}
+
+/* Stop the port's command engine and wait for it to actually go idle.
+ * ahci_udelay() now measures real microseconds, so this waits up to ~1 s. */
 static void ahci_stop_cmd(hba_port_t *port) {
     port->cmd &= ~HBA_PxCMD_ST;
     port->cmd &= ~HBA_PxCMD_FRE;
@@ -137,6 +235,48 @@ static void ahci_stop_cmd(hba_port_t *port) {
         ahci_udelay(1000);
     }
     printk("[AHCI] stop_cmd timeout port\n");
+}
+
+/* Power the drive and (re)establish the link.  Runs after the HBA reset and
+ * before the command engine is started.
+ *
+ * The command engine is stopped first: firmware that handed the HBA over may
+ * have left ST/FRE running, and a COMRESET issued to a live engine does not
+ * reliably retrain the link.  POD is asserted for every port, not only when
+ * CPD reports cold-presence — some HBAs gate the PHY on it regardless.  A
+ * COMRESET is always performed and not just when the link reads down: after a
+ * cold boot DET can latch a stale "present" from firmware while the PHY never
+ * trained, so the only trustworthy link state is the one we trained
+ * ourselves.  A 5 ms settle is left before the first SIG/SSTS sample. */
+static int ahci_port_bring_up(hba_port_t *port, int portno) {
+    ahci_stop_cmd(port);
+
+    uint32_t cmd = port->cmd;
+    cmd |= HBA_PxCMD_SUD;
+    cmd |= HBA_PxCMD_POD;
+    port->cmd = cmd;
+
+    port->sctl &= ~HBA_PxSCTL_MASK;   /* link power management off */
+    port->serr  = 0xFFFFFFFFu;        /* clear stale errors (W1C) */
+    port->is    = 0xFFFFFFFFu;
+
+    ahci_port_comreset(port);
+    ahci_udelay(5000);                /* let the PHY settle before reading SIG */
+
+    if (ahci_wait_link(port, 2000) == 0)
+        return 0;
+
+    {
+        char b[16];
+        printk("[AHCI] port ");
+        snprintf(b, sizeof(b), "%d", portno);
+        printk(b);
+        printk(": link down (DET=");
+        snprintf(b, sizeof(b), "%d", (int)(port->ssts & 0x0F));
+        printk(b);
+        printk(")\n");
+    }
+    return -1;
 }
 
 static void ahci_start_cmd(hba_port_t *port) {
@@ -375,8 +515,36 @@ static int ahci_identify(int portno) {
     if (err) { kfree(id_buf); return -1; }
 
     uint16_t *id16 = (uint16_t *)id_buf;
-    uint32_t  lba28 = (uint32_t)id16[60] | ((uint32_t)id16[61] << 16);
-    ports_info[portno].max_lba = lba28;
+
+    /* Capacity.  Words 60/61 are the 28-bit value and are pinned at
+     * 0x0FFFFFFF (128 GiB) by every drive bigger than that, so prefer the
+     * 48-bit words 100..103 whenever IDENTIFY word 83 bit 10 says they are
+     * valid.  Without this a 256 GB SSD looks like a 128 GiB one. */
+    uint32_t lba28 = (uint32_t)id16[60] | ((uint32_t)id16[61] << 16);
+    uint64_t lba48 = (uint64_t)id16[100]
+                   | ((uint64_t)id16[101] << 16)
+                   | ((uint64_t)id16[102] << 32)
+                   | ((uint64_t)id16[103] << 48);
+    uint64_t sectors = (id16[83] & 0x0400) && lba48 ? lba48 : (uint64_t)lba28;
+
+    /* Word 106: bit 12 set means 4096-byte logical sectors.  The block layer
+     * addresses 512-byte units throughout, so record it and let the caller
+     * decide (a 4Kn drive cannot be exposed correctly today). */
+    uint32_t lsz = 512;
+    if (id16[106] != 0 && id16[106] != 0xFFFF && (id16[106] & 0x1000))
+        lsz = 4096;
+    ports_info[portno].sector_size = lsz;
+
+    if (lsz != 512) {
+        ports_info[portno].max_lba = 0;
+    } else {
+        if (sectors > (uint64_t)AHCI_MAX_LBA) {
+            printk("4" "AHCI (kmod): drive larger than the 2 TiB the 32-bit "
+                       "block layer addresses — clamping");
+            sectors = AHCI_MAX_LBA;
+        }
+        ports_info[portno].max_lba = (uint32_t)sectors;
+    }
 
     for (int i = 0; i < 20; i++) {
         uint16_t w = id16[27 + i];
@@ -387,14 +555,17 @@ static int ahci_identify(int portno) {
     for (int i = 39; i >= 0 && ports_info[portno].model[i] == ' '; i--)
         ports_info[portno].model[i] = '\0';
 
+    for (int i = 0; i < 10; i++) {
+        uint16_t w = id16[10 + i];
+        ports_info[portno].serial[i * 2]     = (char)(w >> 8);
+        ports_info[portno].serial[i * 2 + 1] = (char)(w & 0xFF);
+    }
+    ports_info[portno].serial[20] = '\0';
+    for (int i = 19; i >= 0 && ports_info[portno].serial[i] == ' '; i--)
+        ports_info[portno].serial[i] = '\0';
+
     kfree(id_buf);
     return 0;
-}
-
-static int ahci_first_port(void) {
-    for (int i = 0; i < AHCI_MAX_PORTS; i++)
-        if (ports_info[i].active) return i;
-    return -1;
 }
 
 static void ahci_probe_ports(void) {
@@ -402,6 +573,11 @@ static void ahci_probe_ports(void) {
 
     for (int i = 0; i < AHCI_MAX_PORTS; i++) {
         if (!(pi & (1u << i))) continue;
+
+        /* Power/spin-up first: on a cold real HBA DET is 0 until the drive is
+         * spun up and the link has trained. */
+        if (ahci_port_bring_up(&abar->ports[i], i) < 0)
+            continue;
 
         int dt = ahci_check_type(&abar->ports[i]);
         if (dt == AHCI_DEV_SATA) {
@@ -416,16 +592,26 @@ static void ahci_probe_ports(void) {
     }
 }
 
-static int ahci_init_controller(uint32_t mmio) {
-    uint32_t bar_size = 0x2000;
-
-    for (uint32_t off = 0; off < bar_size; off += 0x1000)
+static int ahci_init_controller(uint32_t mmio, uint32_t mmio_size,
+                                int std_prog_if) {
+    for (uint32_t off = 0; off < mmio_size; off += 0x1000)
         vmm_map(get_current_pd(), mmio + off, mmio + off,
                 PAGE_PRESENT | PAGE_RW | PAGE_PCD | PAGE_PWT);
+
+    /* A non-standard prog_if was accepted on the strength of the class code
+     * alone, so the register block is the only evidence that this really is an
+     * AHCI HBA.  Refuse before resetting anything if it is not. */
+    if (!std_prog_if && !ahci_hba_sane(mmio)) {
+        printk("\x01" "4" "AHCI (kmod): prog_if is not AHCI 1.0 and the BAR "
+                          "does not look like an AHCI register block");
+        return -1;
+    }
 
     abar = (hba_mem_t *)(uintptr_t)mmio;
 
     abar->ghc |= HBA_GHC_AE;
+    /* Spec order: enable AHCI, take ownership from firmware, then reset. */
+    ahci_bios_handoff();
     abar->ghc |= HBA_GHC_HR;
     ahci_udelay(100000);
     abar->ghc &= ~HBA_GHC_HR;
@@ -452,14 +638,40 @@ static int ahci_init_controller(uint32_t mmio) {
     return 0;
 }
 
-/* ── devfs ops ──────────────────────────────────────────────────── */
+/* ── per-disk bindings ──────────────────────────────────────────────
+ * One disk slot per registered whole disk (sda..sdh).  Slots map to a SATA
+ * port through ahci_disk_port[]; a negative port marks a free slot.
+ *
+ * register_blkdev() stores a bare function pointer with no context argument,
+ * so each slot carries its own pair of trampolines (below) that resolve the
+ * slot's port from that table. */
+static const char *const ahci_disk_names[AHCI_MAX_DISKS] = {
+    "sda", "sdb", "sdc", "sdd", "sde", "sdf", "sdg", "sdh",
+};
+static int  ahci_disk_port[AHCI_MAX_DISKS];    /* slot -> SATA port, -1 free */
+static char ahci_disk_devfs[AHCI_MAX_DISKS][12];  /* flat node name ("sda") */
+
+static void ahci_disk_slots_reset(void) {
+    for (int i = 0; i < AHCI_MAX_DISKS; i++) {
+        ahci_disk_port[i]  = -1;
+        ahci_disk_devfs[i][0] = '\0';
+    }
+}
+
+/* drv_priv is the disk slot + 1 so it stays non-NULL for slot 0. */
+static int ahci_disk_of_priv(void *p) {
+    int d = (int)(uintptr_t)p - 1;
+    if (d < 0 || d >= AHCI_MAX_DISKS || ahci_disk_port[d] < 0)
+        return -1;
+    return d;
+}
 
 static int _ahci_devfs_read(void *p, uint32_t off, uint32_t size, char *buf) {
-    (void)p;
-    uint8_t sector_buf[512] __attribute__((aligned(512)));
-    int port = ahci_first_port();
-    if (port < 0) return -1;
+    int d = ahci_disk_of_priv(p);
+    if (d < 0) return -1;
+    int port = ahci_disk_port[d];
 
+    uint8_t sector_buf[512] __attribute__((aligned(512)));
     uint32_t lba = off / 512, written = 0;
     while (written < size) {
         if (ahci_rw_sector(port, lba, sector_buf, 0) < 0) return -1;
@@ -473,11 +685,11 @@ static int _ahci_devfs_read(void *p, uint32_t off, uint32_t size, char *buf) {
 }
 
 static int _ahci_devfs_write(void *p, uint32_t off, uint32_t size, char *buf) {
-    (void)p;
-    uint8_t sector_buf[512] __attribute__((aligned(512)));
-    int port = ahci_first_port();
-    if (port < 0) return -1;
+    int d = ahci_disk_of_priv(p);
+    if (d < 0) return -1;
+    int port = ahci_disk_port[d];
 
+    uint8_t sector_buf[512] __attribute__((aligned(512)));
     uint32_t lba = off / 512, written = 0;
     while (written < size) {
         if (ahci_rw_sector(port, lba, sector_buf, 0) < 0) return -1;
@@ -492,23 +704,33 @@ static int _ahci_devfs_write(void *p, uint32_t off, uint32_t size, char *buf) {
 }
 
 static int _ahci_devfs_status(void *p, char *buf, uint32_t size) {
-    (void)p;
-    int port = ahci_first_port();
-    if (port < 0) {
-        const char *s = "device: sda\ntype: AHCI (no ports)\n";
+    int d = ahci_disk_of_priv(p);
+    if (d < 0) {
+        const char *s = "device: none\ntype: AHCI (detached)\n";
         uint32_t n = 0;
         while (s[n] && n < size - 1) { buf[n] = s[n]; n++; }
         buf[n] = '\0';
         return (int)n;
     }
+    int port = ahci_disk_port[d];
 
     int pos = 0;
-    const char *h1 = "device: sda\ntype: AHCI/SATA (IRQ)\nmodel: ";
-    while (h1[pos] && (uint32_t)pos < size - 1) { buf[pos] = h1[pos]; pos++; }
+    const char *h1 = "device: ";
+    while (*h1 && (uint32_t)pos < size - 1) buf[pos++] = *h1++;
+    for (int i = 0; ahci_disk_names[d][i] && (uint32_t)pos < size - 1; i++)
+        buf[pos++] = ahci_disk_names[d][i];
+    const char *h2 = "\ntype: AHCI/SATA (IRQ)\nport: ";
+    while (*h2 && (uint32_t)pos < size - 1) buf[pos++] = *h2++;
+    {
+        char n[16]; snprintf(n, sizeof(n), "%d", port);
+        for (int i = 0; n[i] && (uint32_t)pos < size - 1; i++) buf[pos++] = n[i];
+    }
+    const char *h3 = "\nmodel: ";
+    while (*h3 && (uint32_t)pos < size - 1) buf[pos++] = *h3++;
     for (int i = 0; ports_info[port].model[i] && (uint32_t)pos < size - 1; i++)
         buf[pos++] = ports_info[port].model[i];
-    buf[pos++] = '\n';
-    buf[pos]   = '\0';
+    if ((uint32_t)pos < size - 1) buf[pos++] = '\n';
+    buf[pos] = '\0';
     return pos;
 }
 
@@ -518,32 +740,56 @@ static devfs_driver_t drv_ahci = {
     .status = _ahci_devfs_status,
 };
 
-static int ahci_blk_port = -1;
-
-static void ahci_blk_read_sector(uint32_t lba, uint8_t *buf) {
-    if (ahci_blk_port < 0) {
+static void ahci_blk_read_port(int d, uint32_t lba, uint8_t *buf) {
+    if (d < 0 || d >= AHCI_MAX_DISKS || ahci_disk_port[d] < 0) {
         memset(buf, 0, 512);
         return;
     }
-    if (ahci_rw_sector(ahci_blk_port, lba, buf, 0) < 0)
+    if (ahci_rw_sector(ahci_disk_port[d], lba, buf, 0) < 0)
         memset(buf, 0, 512);
 }
 
-static void ahci_blk_write_sector(uint32_t lba, uint8_t *buf) {
-    if (ahci_blk_port >= 0)
-        (void)ahci_rw_sector(ahci_blk_port, lba, buf, 1);
+static void ahci_blk_write_port(int d, uint32_t lba, uint8_t *buf) {
+    if (d < 0 || d >= AHCI_MAX_DISKS || ahci_disk_port[d] < 0)
+        return;
+    (void)ahci_rw_sector(ahci_disk_port[d], lba, buf, 1);
 }
+
+#define AHCI_BLK_TRAMPOLINES(n)                                            \
+    static void ahci_blk_read_##n (uint32_t lba, uint8_t *buf)             \
+        { ahci_blk_read_port (n, lba, buf); }                              \
+    static void ahci_blk_write_##n(uint32_t lba, uint8_t *buf)             \
+        { ahci_blk_write_port(n, lba, buf); }
+
+AHCI_BLK_TRAMPOLINES(0)
+AHCI_BLK_TRAMPOLINES(1)
+AHCI_BLK_TRAMPOLINES(2)
+AHCI_BLK_TRAMPOLINES(3)
+AHCI_BLK_TRAMPOLINES(4)
+AHCI_BLK_TRAMPOLINES(5)
+AHCI_BLK_TRAMPOLINES(6)
+AHCI_BLK_TRAMPOLINES(7)
+
+static void (*const ahci_blk_read_fn[AHCI_MAX_DISKS])(uint32_t, uint8_t *) = {
+    ahci_blk_read_0, ahci_blk_read_1, ahci_blk_read_2, ahci_blk_read_3,
+    ahci_blk_read_4, ahci_blk_read_5, ahci_blk_read_6, ahci_blk_read_7,
+};
+static void (*const ahci_blk_write_fn[AHCI_MAX_DISKS])(uint32_t, uint8_t *) = {
+    ahci_blk_write_0, ahci_blk_write_1, ahci_blk_write_2, ahci_blk_write_3,
+    ahci_blk_write_4, ahci_blk_write_5, ahci_blk_write_6, ahci_blk_write_7,
+};
 
 /* ── teardown ───────────────────────────────────────────────────── */
 
 static void ahci_detach(void) {
-    unregister_blkdev("sda");
-    ahci_blk_port = -1;
-
-    if (devfs_was_registered) {
-        unregister_chrdev("sda");
-        devfs_was_registered = 0;
+    for (int d = 0; d < AHCI_MAX_DISKS; d++) {
+        if (ahci_disk_port[d] < 0) continue;
+        unregister_blkdev(ahci_disk_names[d]);
+        if (ahci_disk_devfs[d][0])
+            unregister_chrdev(ahci_disk_devfs[d]);
     }
+    ahci_disk_slots_reset();
+    devfs_was_registered = 0;
 
     if (abar) {
         /* Quiesce: disable HBA and per-port IRQs, stop command engines */
@@ -595,9 +841,29 @@ int pci_driver_probe(pci_device_t *pdev) {
         return -1;
     }
 
-    if (pdev->prog_if != 0x01) {
-        printk("[AHCI] prog_if!=0x01 (IDE-emulation) — skipping\n");
+    /* SATA HBAs are class 01/06.  AHCI 1.0 is prog_if 0x01, but OEM firmware
+     * is not always spec-perfect: boards booting a vendor storage mode (HP /
+     * Intel RAID, some UEFI builds) report 0x00 (vendor specific) or 0x02
+     * (serial storage bus) for a controller that is otherwise a plain AHCI
+     * HBA.  Rejecting those on the raw prog_if is why the driver could not
+     * reach a real disk.  Accept the values a SATA HBA may report, and for
+     * anything but 0x01 confirm the register block is AHCI before using it
+     * (see ahci_init_controller). */
+    int std_prog_if = (pdev->prog_if == 0x01);
+    if (!ahci_prog_if_sata_hba(pdev->prog_if)) {
+        char b[8];
+        printk("[AHCI] prog_if=");
+        snprintf(b, sizeof(b), "0x%x", (unsigned)pdev->prog_if);
+        printk(b);
+        printk(": reserved SATA interface, not AHCI - skipping\n");
         return -1;
+    }
+    if (!std_prog_if) {
+        char b[8];
+        printk("[AHCI] prog_if=");
+        snprintf(b, sizeof(b), "0x%x", (unsigned)pdev->prog_if);
+        printk(b);
+        printk(" (non-standard): verifying the AHCI register block\n");
     }
 
     irq_spinlock_init(&ahci_lock);
@@ -615,26 +881,69 @@ int pci_driver_probe(pci_device_t *pdev) {
     ahci_dev = pdev->dev;
     ahci_fn  = pdev->fn;
 
-    uint32_t mmio = 0;
+    /* Memory space + bus master must be enabled before the ABAR is readable:
+     * the BAR probing below pulls CAP/VS out of MMIO, and without MEM those
+     * reads return 0xffffffff.  INTx routing stays enabled (bit 10 clear). */
+    saved_pci_cmd_dw = pci_read_config_dword(pdev->bus, pdev->dev, pdev->fn, 0x04);
+    {
+        uint32_t cmd = saved_pci_cmd_dw;
+        cmd |=  0x06u;            /* MEM | BUS_MASTER */
+        cmd &= ~(1u << 10);       /* clear INTx Disable */
+        pci_write_config_dword(pdev->bus, pdev->dev, pdev->fn, 0x04, cmd);
+    }
+
+    /* Pick the ABAR by content, not by position.  The AHCI spec puts it at BAR5
+     * but firmware does not always agree: on the HP 290 the SATA function
+     * reports BAR0 as a populated 0x2000 memory region (the MSI-X table), so a
+     * "first memory BAR" pick reads a block whose CAP/VS are not AHCI — PI then
+     * reads 0 and the controller looks empty.  Map every memory BAR and take
+     * the one whose CAP/VS describe an AHCI HBA. */
+    uint64_t mmio64  = 0;
+    uint64_t mmio_sz = 0;
+    int      mmio_bar = -1;
     for (int i = 0; i < 6; i++) {
-        if (!pdev->bars[i].is_io && pdev->bars[i].base) {
-            mmio = pdev->bars[i].base; break;
+        pci_bar_t *bar = &pdev->bars[i];
+        if (bar->is_io || !bar->base) continue;
+        if (bar->base >= 0x100000000ULL) continue;   /* 32-bit MMIO map only */
+        uint32_t base = (uint32_t)bar->base;
+        vmm_map(get_current_pd(), base, base,
+                PAGE_PRESENT | PAGE_RW | PAGE_PCD | PAGE_PWT);
+        if (ahci_hba_sane(base)) {
+            mmio64   = bar->base;
+            mmio_sz  = bar->size;
+            mmio_bar = i;
+            break;
         }
     }
-    if (!mmio)
-        mmio = pci_read_config_dword(pdev->bus, pdev->dev, pdev->fn, 0x24) & ~0xFu;
+    if (mmio_bar < 0) {
+        /* Nothing AHCI-looking in the enumerated table (legacy path): try raw
+         * BAR5, the spec position, before giving up. */
+        uint32_t raw5 = pci_read_config_dword(pdev->bus, pdev->dev, pdev->fn, 0x24) & 0xFFFFFFF0u;
+        if (raw5) {
+            vmm_map(get_current_pd(), raw5, raw5,
+                    PAGE_PRESENT | PAGE_RW | PAGE_PCD | PAGE_PWT);
+            if (ahci_hba_sane(raw5)) { mmio64 = raw5; mmio_sz = 0x2000; mmio_bar = 5; }
+        }
+    }
+    if (mmio_bar < 0) {
+        printk("\x01" "4" "AHCI (kmod): the BAR does not look like an AHCI "
+                          "register block");
+        return -1;
+    }
+    uint32_t mmio = (uint32_t)mmio64;
+
+    /* HBA register window: 0x00..0xFF generic + 32 ports * 0x80. */
+    if (mmio_sz < 0x2000)  mmio_sz = 0x2000;
+    if (mmio_sz > 0x10000) mmio_sz = 0x10000;
+    uint32_t mmio_size = (uint32_t)mmio_sz;
     if (!mmio) {
         printk("3" "AHCI (kmod): no MMIO BAR");
         return -1;
     }
 
-    /* Save PCI command register, enable bus master + memory space, leave INTx
-     * routing enabled (clear bit 10 == INTx Disable; we WANT INTx). */
-    saved_pci_cmd_dw = pci_read_config_dword(pdev->bus, pdev->dev, pdev->fn, 0x04);
-    uint32_t cmd     = saved_pci_cmd_dw;
-    cmd |=  0x06u;            /* MEM | BUS_MASTER */
-    cmd &= ~(1u << 10);       /* clear INTx Disable */
-    pci_write_config_dword(pdev->bus, pdev->dev, pdev->fn, 0x04, cmd);
+    /* The PCI command register (MEM | BUS_MASTER, INTx enabled) was already
+     * programmed above, before the ABAR probe, because the CAP/VS reads need
+     * memory space enabled. */
 
     /* Wire the ISR before enabling controller IE: msidev_register() picks
      * MSI-X when the HBA has it and MSI otherwise. */
@@ -652,60 +961,113 @@ int pci_driver_probe(pci_device_t *pdev) {
         }
     }
 
-    if (ahci_init_controller(mmio) < 0) {
+    if (ahci_init_controller(mmio, mmio_size, std_prog_if) < 0) {
         printk("3" "AHCI (kmod): controller init failed");
         ahci_detach();
         return -1;
     }
 
-    int port = -1;
-    for (int i = 0; i < AHCI_MAX_PORTS; i++) {
+    /* Register every SATA port that carries a drive: on real hardware the
+     * drive is not necessarily on port 0, and a second disk is common.  Port
+     * order still decides which disk the block layer mounts as root (the
+     * first registered whole disk wins). */
+    ahci_attached = 1;            /* set BEFORE devfs so detach restores PCI cmd */
+    ahci_disk_slots_reset();
+
+    int ndisk = 0;
+    for (int i = 0; i < AHCI_MAX_PORTS && ndisk < AHCI_MAX_DISKS; i++) {
         if (!ports_info[i].active) continue;
-        if (ahci_identify(i) == 0) { port = i; break; }
+
+        char b[16];
+
+        if (ahci_identify(i) != 0) {
+            printk("\x01" "4" "AHCI (kmod): IDENTIFY failed on port ");
+            snprintf(b, sizeof(b), "%d", i);
+            printk(b);
+            printk(" - port skipped\n");
+            continue;
+        }
+        if (ports_info[i].sector_size != 512) {
+            printk("\x01" "4" "AHCI (kmod): port ");
+            snprintf(b, sizeof(b), "%d", i);
+            printk(b);
+            printk(": 4096-byte logical sectors unsupported - port skipped\n");
+            continue;
+        }
+        if (ports_info[i].max_lba == 0) {
+            printk("\x01" "4" "AHCI (kmod): port ");
+            snprintf(b, sizeof(b), "%d", i);
+            printk(b);
+            printk(": drive reports zero capacity - port skipped\n");
+            continue;
+        }
+
+        int d = ndisk;
+        /* Flat node at /dev/sda — the Linux layout; /dev/disk holds only the
+         * by-id symlinks (published by vfsdev from the disk identity). */
+        snprintf(ahci_disk_devfs[d], sizeof(ahci_disk_devfs[d]), "%s",
+                 ahci_disk_names[d]);
+
+        if (!register_chrdev(ahci_disk_devfs[d], DEVFS_F_BLOCK, &drv_ahci,
+                             (void *)(uintptr_t)(d + 1))) {
+            printk("\x01" "4" "AHCI (kmod): register_chrdev failed for ");
+            printk(ahci_disk_devfs[d]);
+            printk("\n");
+            continue;
+        }
+        devfs_was_registered = 1;
+
+        ahci_disk_port[d] = i;    /* live before the callbacks are published */
+        if (register_blkdev(ahci_disk_names[d], ports_info[i].max_lba,
+                            ahci_blk_read_fn[d], ahci_blk_write_fn[d]) != 0) {
+            printk("\x01" "4" "AHCI (kmod): register_blkdev failed for ");
+            printk(ahci_disk_names[d]);
+            printk("\n");
+            unregister_chrdev(ahci_disk_devfs[d]);
+            ahci_disk_devfs[d][0] = '\0';
+            ahci_disk_port[d]    = -1;
+            continue;
+        }
+
+        /* Stable identity for /dev/disk/by-id: model plus serial, so several
+         * identical drives stay distinguishable.  Spaces become '_'. */
+        {
+            char ident[64];
+            if (ports_info[i].serial[0])
+                snprintf(ident, sizeof(ident), "ata-%.37s_%.20s",
+                         ports_info[i].model, ports_info[i].serial);
+            else
+                snprintf(ident, sizeof(ident), "ata-%.40s",
+                         ports_info[i].model);
+            for (char *q = ident; *q; q++)
+                if (*q == ' ') *q = '_';
+            blkdev_set_ident(ahci_disk_names[d], ident);
+        }
+
+        printk("[AHCI] ");
+        printk(ahci_disk_names[d]);
+        printk(" <- port ");
+        snprintf(b, sizeof(b), "%d", i);
+        printk(b);
+        printk(" model=");
+        printk(ports_info[i].model);
+        printk(" serial=");
+        printk(ports_info[i].serial);
+        printk(" max_lba=0x");
+        snprintf(b, sizeof(b), "%x", (unsigned)ports_info[i].max_lba);
+        printk(b);
+        printk("\n");
+
+        ndisk++;
     }
-    if (port < 0) port = ahci_first_port();
-    if (!ahci_ready || port < 0) {
-        printk("4" "AHCI (kmod): no active SATA ports");
+
+    if (!ahci_ready || ndisk == 0) {
+        printk("\x01" "4" "AHCI (kmod): no usable SATA disk found");
         ahci_detach();
         return -1;
     }
 
-    if (!ports_info[port].model[0]) {
-        printk("4" "AHCI (kmod): identify timeout, using fallback geometry");
-        ports_info[port].max_lba = 0x0FFFFFFFu;
-        ports_info[port].model[0] = 'S';
-        ports_info[port].model[1] = 'A';
-        ports_info[port].model[2] = 'T';
-        ports_info[port].model[3] = 'A';
-        ports_info[port].model[4] = ' ';
-        ports_info[port].model[5] = 'D';
-        ports_info[port].model[6] = 'i';
-        ports_info[port].model[7] = 's';
-        ports_info[port].model[8] = 'k';
-        ports_info[port].model[9] = '\0';
-    }
-
-    {
-        char tmp[16]; snprintf(tmp, sizeof(tmp), "%d", (int)(port));
-        printk("[AHCI] active SATA port="); printk(tmp);
-        printk(" model="); printk(ports_info[port].model);
-        printk(" IRQ=enabled\n");
-    }
-
-    ahci_attached = 1;            /* set BEFORE devfs so detach restores PCI cmd */
-
-    if (register_chrdev("sda", DEVFS_F_BLOCK, &drv_ahci, 0)) {
-        devfs_was_registered = 1;
-    } else {
-        printk("4" "AHCI (kmod): register_chrdev('sda') failed");
-    }
-
-    ahci_blk_port = port;
-    if (register_blkdev("sda", ports_info[port].max_lba, ahci_blk_read_sector,
-                        ahci_blk_write_sector) != 0)
-        printk("4" "AHCI (kmod): register_blkdev('sda') failed");
-
-    printk("6" "AHCI (kmod): IRQ-driven driver attached — /dev/sda registered");
+    printk("\x01" "6" "AHCI (kmod): attached, /dev/sd[a-h] registered\n");
     return 0;
 }
 
